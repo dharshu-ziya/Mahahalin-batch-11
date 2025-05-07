@@ -1,0 +1,173 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import numpy as np
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+# --- 1. Load and Preprocess Environmental Data ---
+# Assume you have a CSV file named 'air_quality_data.csv' with columns like:
+# 'timestamp', 'PM2.5', 'PM10', 'SO2', 'NO2', 'O3', 'CO', 'temperature', 'humidity', 'wind_speed', 'wind_direction'
+
+try:
+    df = pd.read_csv('air_quality_data.csv', parse_dates=['timestamp'], index_col='timestamp')
+    print("Data loaded successfully.")
+except FileNotFoundError:
+    print("Error: 'air_quality_data.csv' not found. Please ensure the file exists.")
+    exit()
+
+# Handle missing values (imputation using forward fill, you might choose a different strategy)
+df.fillna(method='ffill', inplace=True)
+
+# --- 2. Feature Engineering and Environmental Insights ---
+
+def create_time_features(df):
+    df['hour'] = df.index.hour
+    df['day_of_week'] = df.index.dayofweek
+    df['day_of_year'] = df.index.dayofyear
+    df['month'] = df.index.month
+    return df
+
+df = create_time_features(df)
+
+# Consider cyclical features (e.g., hour, day of week) using sine and cosine transformations
+def cyclical_features(df, col, max_val):
+    df[col + '_sin'] = np.sin(2 * np.pi * df[col] / max_val)
+    df[col + '_cos'] = np.cos(2 * np.pi * df[col] / max_val)
+    df.drop(col, axis=1, inplace=True)
+    return df
+
+df = cyclical_features(df, 'hour', 24)
+df = cyclical_features(df, 'day_of_week', 7)
+df = cyclical_features(df, 'day_of_year', 366)
+df = cyclical_features(df, 'month', 12)
+
+# You can incorporate external environmental data here if available
+# For example, weather forecasts (temperature, precipitation), traffic data,
+# industrial activity indicators, satellite imagery-derived data (e.g., aerosol optical depth).
+# Merge these dataframes based on the timestamp.
+
+# --- 3. Define Target Variable and Features ---
+target_column = 'PM2.5'  # Predict PM2.5 level
+features = [col for col in df.columns if col != target_column]
+
+# --- 4. Data Scaling ---
+scaler_features = StandardScaler()
+df[features] = scaler_features.fit_transform(df[features])
+
+scaler_target = StandardScaler()
+df[target_column] = scaler_target.fit_transform(df[[target_column]])
+
+# --- 5. Prepare Data for LSTM (Time Series Forecasting) ---
+def create_sequences(data, target, n_steps):
+    X, y = [], []
+    for i in range(len(data) - n_steps):
+        X.append(data.iloc[i:(i + n_steps)].values)
+        y.append(target.iloc[i + n_steps])
+    return np.array(X), np.array(y)
+
+n_steps = 24  # Predict based on the previous 24 time steps (you can adjust this)
+X, y = create_sequences(df[features], df[target_column], n_steps)
+
+# --- 6. Split Data into Training and Testing Sets ---
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False)
+
+# --- 7. Build the LSTM Model ---
+model = Sequential([
+    LSTM(units=64, return_sequences=True, input_shape=(n_steps, X_train.shape[2])),
+    Dropout(0.2),
+    LSTM(units=64, return_sequences=False),
+    Dropout(0.2),
+    Dense(units=32),
+    Dense(units=1)  # Output layer for single value prediction
+])
+
+optimizer = Adam(learning_rate=0.001)
+model.compile(optimizer=optimizer, loss='mse')
+
+model.summary()
+
+# --- 8. Train the Model ---
+history = model.fit(X_train, y_train, epochs=50, batch_size=32, validation_split=0.1, shuffle=False)
+
+# --- 9. Evaluate the Model ---
+y_pred_scaled = model.predict(X_test)
+y_pred = scaler_target.inverse_transform(y_pred_scaled)
+y_true = scaler_target.inverse_transform(y_test.reshape(-1, 1))
+
+mse = mean_squared_error(y_true, y_pred)
+mae = mean_absolute_error(y_true, y_pred)
+rmse = np.sqrt(mse)
+
+print(f'Mean Squared Error (MSE): {mse:.2f}')
+print(f'Mean Absolute Error (MAE): {mae:.2f}')
+print(f'Root Mean Squared Error (RMSE): {rmse:.2f}')
+
+# --- 10. Visualize Predictions ---
+plt.figure(figsize=(12, 6))
+plt.plot(df.index[-len(y_true):], y_true, label='Actual PM2.5', color='blue')
+plt.plot(df.index[-len(y_pred):], y_pred, label='Predicted PM2.5', color='red')
+plt.title('Air Quality Prediction (PM2.5)')
+plt.xlabel('Time')
+plt.ylabel('PM2.5 Level')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# --- 11. Real-time Prediction (Illustrative) ---
+def predict_real_time(model, last_n_steps_scaled, scaler_target):
+    """
+    Predicts the next time step's air quality level.
+
+    Args:
+        model: Trained LSTM model.
+        last_n_steps_scaled: Scaled data for the last n_steps time points (numpy array).
+        scaler_target: Scaler used for the target variable.
+
+    Returns:
+        Predicted air quality level (unscaled).
+    """
+    input_sequence = np.expand_dims(last_n_steps_scaled, axis=0)
+    predicted_scaled = model.predict(input_sequence)[0, 0]
+    predicted_original = scaler_target.inverse_transform(np.array([[predicted_scaled]]))[0, 0]
+    return predicted_original
+
+# Assuming you have new, unseen data (e.g., the latest 24 hours)
+# new_data = df[features].iloc[-n_steps:].values
+# new_data_scaled = scaler_features.transform(new_data)
+# predicted_pm25 = predict_real_time(model, new_data_scaled, scaler_target)
+# print(f"\nReal-time Prediction of PM2.5: {predicted_pm25:.2f}")
+
+# --- 12. Advanced Considerations and Further Improvements ---
+
+# - Incorporate more sophisticated feature engineering:
+#   - Interaction terms between pollutants and meteorological variables.
+#   - Lagged features of the target variable (autoregressive components).
+#   - External indices related to pollution (e.g., AQI from previous periods).
+
+# - Explore different machine learning models:
+#   - Recurrent Neural Networks (RNNs) with attention mechanisms.
+#   - Transformer networks, which have shown success in sequence modeling.
+#   - Hybrid models combining time series forecasting with other ML techniques.
+
+# - Integrate environmental insights more deeply:
+#   - Use domain knowledge to weight features based on their expected impact.
+#   - Incorporate spatial information if your data includes multiple monitoring stations (e.g., using Convolutional LSTMs or Graph Neural Networks).
+#   - Model the transport and dispersion of pollutants using meteorological data.
+
+# - Hyperparameter tuning:
+#   - Use techniques like GridSearchCV or RandomizedSearchCV to find the optimal hyperparameters for your LSTM model.
+
+# - Ensemble methods:
+#   - Train multiple models and combine their predictions to improve robustness and accuracy.
+
+# - Error analysis:
+#   - Analyze the cases where your model performs poorly to identify potential areas for improvement.
+
+# - Deployment and monitoring:
+#   - Consider how the model will be deployed and continuously monitored for performance drift.
+#   - Implement retraining strategies to adapt to changing environmental conditions.
